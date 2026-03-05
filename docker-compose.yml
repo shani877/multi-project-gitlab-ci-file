@@ -1,0 +1,16 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${DOCKER_REGISTRY}:${TAG_NAME}
+    container_name: ${CI_PROJECT_NAME}
+    ports:
+      - "${BACKEND_PORT}:8000"
+    restart: unless-stopped
+    networks:
+      - sofmen-docker-network
+
+networks:
+  sofmen-docker-network:
+    external: true

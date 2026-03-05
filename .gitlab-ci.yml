@@ -1,0 +1,222 @@
+stages:
+  - test
+  - build
+  - deploy
+
+variables:
+  ENV_FILE: .env
+  COMPOSE_FILE: docker-compose.yml
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  REGISTRY: registry.gitlab.sofmen.com
+  PROJECT_NAME: ${CI_PROJECT_NAME}
+  GROUP_NAME: ${CI_PROJECT_NAMESPACE}
+  backend_project_name: ${CI_PROJECT_NAME}
+  DOCKER_REGISTRY: ${REGISTRY}/${GROUP_NAME}/${backend_project_name}
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.pip-cache"
+  CONTAINER_NAME: ${CI_PROJECT_NAME}
+  TEST_DOCKERFILE: Dockerfile.test
+  TAG_NAME: ${CI_COMMIT_REF_NAME}
+
+before_script:
+  - |
+    echo "Logging in to GitLab Container Registry..."
+    echo "Using registry: ${REGISTRY}"
+    echo "Full registry path: ${DOCKER_REGISTRY}"
+    
+    # Login to registry using secure method
+    echo "${DOCKER_REGISTRY_PASSWORD}" | docker login -u "${DOCKER_REGISTRY_USER}" --password-stdin "${REGISTRY}"
+    docker info
+
+test:
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - |
+      # Build and start the test database container
+      echo "Building test database container..."
+      docker build -f ${TEST_DOCKERFILE} -t ${CI_PROJECT_NAME}-test .
+      
+      echo "Starting test database container..."
+      docker run -d --name test-db --network host ${CI_PROJECT_NAME}-test
+      
+      # Install Python dependencies
+      echo "Installing Python dependencies..."
+      pip install pytest pytest-asyncio pytest-cov
+      pip install -r requirements.txt
+      
+      # Wait for PostgreSQL to be ready
+      echo "Waiting for PostgreSQL to be ready..."
+      for i in $(seq 1 30); do
+        if docker exec test-db pg_isready -h localhost -p 5432 -U postgres; then
+          echo "PostgreSQL is ready"
+          break
+        fi
+        if [ $i -eq 30 ]; then
+          echo "PostgreSQL failed to start"
+          exit 1
+        fi
+        echo "Waiting for PostgreSQL... attempt $i"
+        sleep 2
+      done
+      
+      # Run tests
+      echo "Running tests..."
+      PYTHONPATH=. pytest tests/api/v1/endpoints/ -v
+      
+      # Cleanup
+      echo "Cleaning up..."
+      docker stop test-db
+      docker rm test-db
+  cache:
+    key: test-cache
+    paths:
+      - .pip-cache
+    policy: pull-push
+  only:
+    - dev
+    - staging
+    - master
+  allow_failure: true
+
+build:
+  stage: build
+  needs: []
+  only:
+    - dev
+    - staging
+    - master
+  environment:
+    name: ${CI_COMMIT_REF_NAME}
+  script: |
+    echo "Generating .env file for ${CI_COMMIT_REF_NAME} environment"
+    # Copy environment file to current directory for the script
+    cp environment_setup/env.${CI_COMMIT_REF_NAME} env.${CI_COMMIT_REF_NAME} || {
+      echo "Error: Could not find environment file environment_setup/env.${CI_COMMIT_REF_NAME}"
+      echo "Available files in environment_setup:"
+      ls -la environment_setup/
+      exit 1
+    }
+    # Make the script executable
+    chmod +x ./environment_setup/generate_env.sh
+    CI_COMMIT_REF_NAME=${CI_COMMIT_REF_NAME} ./environment_setup/generate_env.sh
+    
+    echo "Generated .env file contents (sensitive info masked):"
+    sed 's/=.*/=***/' .env
+
+    echo "Building and tagging images with: ${CI_COMMIT_REF_NAME}"
+    echo "DOCKER_REGISTRY value: ${DOCKER_REGISTRY}"
+    echo "Full image name: ${REGISTRY}/${GROUP_NAME}/${backend_project_name}:${CI_COMMIT_REF_NAME}"
+    
+    # Verify registry login
+    echo "Verifying registry login before build..."
+    echo "${DOCKER_REGISTRY_PASSWORD}" | docker login -u "${DOCKER_REGISTRY_USER}" --password-stdin "${REGISTRY}"
+    
+    # Build with registry name directly and add unique tag
+    echo "Building image with tags:"
+    echo "- ${CI_COMMIT_REF_NAME} (branch/environment tag)"
+    docker build --network=host -t ${REGISTRY}/${GROUP_NAME}/${backend_project_name}:${CI_COMMIT_REF_NAME} .
+    
+    # Push images with both tags
+    echo "Pushing images with both tags..."
+    docker push ${REGISTRY}/${GROUP_NAME}/${backend_project_name}:${CI_COMMIT_REF_NAME}
+    
+    # Save .env file as artifact
+    echo "Saving .env file as artifact"
+    cp .env .env.${CI_COMMIT_REF_NAME}
+  artifacts:
+    paths:
+      - .env.${CI_COMMIT_REF_NAME}
+    expire_in: 1 week
+
+deploy:
+  stage: deploy
+  environment:
+    name: ${CI_COMMIT_REF_NAME}
+  only:
+    - dev
+    - staging
+    - master
+  needs: ["build"]
+  when: on_success
+  before_script:
+    - echo "${DEPLOY_SSH_KEY}" > deploy_key
+    - chmod 600 deploy_key
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan -H ${DEPLOY_HOST} >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+  script:
+    - echo "Generating nginx configuration..."
+    - chmod +x ./environment_setup/generate_nginx.sh
+    - ./environment_setup/generate_nginx.sh -p "${CI_PROJECT_NAME}" -g "${CI_PROJECT_NAMESPACE}" -b "${BACKEND_PORT}" -e "${CI_COMMIT_REF_NAME}" -o "nginx.conf"
+    - echo "Generated nginx configuration:"
+    - cat nginx.conf
+    - echo "Testing SSH connection..."
+    - ssh -i deploy_key -o StrictHostKeyChecking=no root@${DEPLOY_HOST} "echo 'SSH connection successful'"
+    - echo "Copy necessary files to deployment machine"
+    - ssh -i deploy_key -o StrictHostKeyChecking=no root@${DEPLOY_HOST} "mkdir -p /root/${backend_project_name}"
+    - scp -i deploy_key -o StrictHostKeyChecking=no docker-compose.yml root@${DEPLOY_HOST}:/root/${backend_project_name}/docker-compose.yml
+    - scp -i deploy_key -o StrictHostKeyChecking=no .env.${CI_COMMIT_REF_NAME} root@${DEPLOY_HOST}:/root/${backend_project_name}/.env
+    - scp -i deploy_key -o StrictHostKeyChecking=no nginx.conf root@${DEPLOY_HOST}:/root/${backend_project_name}/nginx.conf || true
+    - |
+      cat > docker-compose.override.yml << EOF
+      version: '3.8'
+      services:
+        app:
+          image: ${DOCKER_REGISTRY}:${TAG_NAME}
+          container_name: ${CONTAINER_NAME}
+          env_file:
+            - .env
+          environment:
+            - "BACKEND_PORT=${BACKEND_PORT}"
+          ports:
+            - "${BACKEND_PORT}:8000"
+      EOF
+    - scp -i deploy_key -o StrictHostKeyChecking=no docker-compose.override.yml root@${DEPLOY_HOST}:/root/${backend_project_name}/
+    - echo "Deploy on the deployment machine ${DEPLOY_HOST}"
+    - |
+      ssh -i deploy_key -o StrictHostKeyChecking=no root@${DEPLOY_HOST} "
+        set -x
+        cd /root/${backend_project_name} &&
+        echo 'Using variables:' &&
+        echo 'DOCKER_REGISTRY: '${DOCKER_REGISTRY} &&
+        echo 'TAG_NAME: '${TAG_NAME} &&
+        echo 'BACKEND_PORT: '${BACKEND_PORT} &&
+        echo 'CONTAINER_NAME: '${CONTAINER_NAME} &&
+        
+        # Login to registry using secure method
+        echo "${DOCKER_REGISTRY_PASSWORD}" | docker login -u "${DOCKER_REGISTRY_USER}" --password-stdin "${REGISTRY}" &&
+        docker pull ${DOCKER_REGISTRY}:${TAG_NAME} &&
+        
+        # Debug: Show docker-compose files content
+        echo 'Base docker-compose.yml content:'
+        cat docker-compose.yml &&
+        echo 'Override docker-compose.override.yml content:'
+        cat docker-compose.override.yml &&
+        
+        # Create container
+        docker-compose down &&
+        
+        docker-compose -p ${backend_project_name} -f docker-compose.yml -f docker-compose.override.yml up -d --force-recreate &&
+        echo 'Container status after deployment:' &&
+        docker ps -a | grep ${CONTAINER_NAME} &&
+        echo 'Waiting 30 seconds for container to initialize...' &&
+        sleep 30 &&
+        echo 'Container status after waiting:' &&
+        docker ps -a | grep ${CONTAINER_NAME} &&
+        echo 'Container logs:' &&
+        docker logs ${CONTAINER_NAME} 2>&1 || true &&
+        
+        echo 'Container health check status:' &&
+        docker inspect --format='{{json .State.Health}}' ${CONTAINER_NAME} || true &&
+        
+        # Try to configure nginx, but continue even if it fails
+        cp /root/${backend_project_name}/nginx.conf /etc/nginx/sites-enabled/${GROUP_NAME}-${backend_project_name} || true &&
+        nginx -s reload || true
+      "
